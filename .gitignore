@@ -1,0 +1,23 @@
+# --- Python Virtual Environments (CRITICAL) ---
+venv/
+env/
+.venv/
+.env
+
+# --- Python Compiled Code (Junk) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environment Variables (Security) ---
+# NEVER commit your secrets/passwords!
+.env
+.env.local
+
+# --- Operating System Junk ---
+.DS_Store
+Thumbs.db
+
+# --- IDE Settings (Optional but recommended) ---
+.vscode/
+.idea/
