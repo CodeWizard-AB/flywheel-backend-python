@@ -1,152 +1,154 @@
-import cv2  # type: ignore
-import numpy as np # type: ignore
+import cv2
+import numpy as np
 import math
 import base64
 import time
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect # type: ignore
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI()
 
-# --- 1. PHYSICS ENGINE CLASS ---
+# --- 1. ROBUST PHYSICS ENGINE (Phase Accumulation) ---
 class PhysicsEngine:
     def __init__(self):
-        self.total_rotations = 0
-        self.last_angle = None
+        self.accumulated_angle = 0.0  # Total radians travelled (can go to infinity)
+        self.last_raw_angle = None
         self.last_time = time.time()
+        
         self.current_rpm = 0.0
-        # Stabilization buffer
-        self.rpm_buffer = []
+        self.rpm_buffer = []  # For smoothing
+        
+        # Output values
+        self.display_rotations = 0
+        self.display_rpm = 0
 
     def process_coordinates(self, x, y, width, height):
-        # Calculate center
+        # 1. Get Raw Angle (-PI to +PI)
         cx, cy = width // 2, height // 2
+        # Note: We invert Y because image coordinates go down, but math coordinates go up
         dx = x - cx
-        dy = y - cy
+        dy = -(y - cy) 
         
-        # Calculate Angle (-PI to +PI)
-        angle = math.atan2(dy, dx)
+        raw_angle = math.atan2(dy, dx)
 
-        # Logic: Detect full rotation
-        if self.last_angle is not None:
-            delta = angle - self.last_angle
+        if self.last_raw_angle is not None:
+            # 2. Calculate Change (Delta)
+            delta = raw_angle - self.last_raw_angle
             
-            # Check for "Wrap Around" (passing the 3 o'clock position)
-            # If angle jumps from ~3.14 to ~-3.14 (Counter-Clockwise)
-            if delta < -5:
-                self.count_rotation()
-            # If angle jumps from ~-3.14 to ~3.14 (Clockwise)
-            elif delta > 5:
-                self.count_rotation()
+            # 3. Fix Phase Wrap-Around (The "Jitter Killer")
+            # If jump is huge (e.g. +3.1 to -3.1), it means we crossed the line.
+            # We assume the wheel physically cannot rotate 180 degrees (PI) in one frame (0.05s).
+            if delta > math.pi:
+                delta -= 2 * math.pi
+            elif delta < -math.pi:
+                delta += 2 * math.pi
+            
+            # 4. Add to Total
+            self.accumulated_angle += delta
+            
+            # 5. Calculate Rotations (Total Angle / 2PI)
+            # Use floor logic so 0.99 rotations shows as 0, 1.01 shows as 1
+            self.display_rotations = int(abs(self.accumulated_angle) / (2 * math.pi))
+            
+            # 6. Calculate RPM
+            self.calculate_rpm(delta)
         
-        self.last_angle = angle
-        return self.total_rotations, int(self.current_rpm)
+        self.last_raw_angle = raw_angle
+        return self.display_rotations, self.display_rpm
 
-    def count_rotation(self):
-        self.total_rotations += 1
+    def calculate_rpm(self, delta_radians):
         now = time.time()
-        diff = now - self.last_time
+        dt = now - self.last_time
         
-        if diff > 0:
-            # Instant RPM = (1 rot / time_diff) * 60 seconds
-            inst_rpm = (1.0 / diff) * 60.0
+        # Only update RPM every 100ms to prevent number flickering
+        if dt > 0.1:
+            # RPM = (Radians per sec) * (60 / 2PI)
+            # We calculate RPM based on the accumulated change over time dt
+            rads_per_sec = abs(delta_radians) / dt # This is instantaneous, noisy
             
-            # SMOOTHING ALGORITHM:
-            # Real-world physics data is noisy. We use a "Moving Average".
-            # 80% previous stable speed + 20% new speed
-            self.current_rpm = (self.current_rpm * 0.8) + (inst_rpm * 0.2)
+            # Better RPM: (Total angle change since last update) / dt
+            # But for simplicity, we smooth the instantaneous value:
             
-        self.last_time = now
+            # Calculate instantaneous RPM from angular velocity
+            # velocity = rads / time
+            # RPM = velocity * 9.5493
+            instant_rpm = (abs(delta_radians) / dt) * 9.5493
+            
+            # Filter out crazy noise (e.g. > 3000 RPM is impossible for lab wheel)
+            if instant_rpm < 3000:
+                # Weighted Average (Smooths out jitter)
+                # 80% old value, 20% new value
+                self.current_rpm = (self.current_rpm * 0.8) + (instant_rpm * 0.2)
+            
+            self.display_rpm = int(self.current_rpm)
+            self.last_time = now
 
-# Initialize the engine
+# Initialize
 physics = PhysicsEngine()
 
-# --- 2. COMPUTER VISION PROCESSOR ---
+# --- 2. VISION PROCESSOR (Stricter Red Filter) ---
 def process_frame(base64_string):
     try:
-        # Decode the image sent from the phone
-        # Remove header if present (data:image/jpeg;base64,...)
         if ',' in base64_string:
             base64_string = base64_string.split(',')[1]
-            
         nparr = np.frombuffer(base64.b64decode(base64_string), np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return None
+        if frame is None: return None
     except:
         return None
 
-    # A. Convert to HSV (Hue, Saturation, Value)
-    # This is critical for ignoring Rust. Rust has low Saturation.
+    # HSL Masking
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # B. Define the "Vivid Red" Range
-    # We use two ranges because Red wraps around 0 and 180 in HSV
+    # Range 1: Deep Red
+    lower1 = np.array([0, 140, 60])   # Increased Saturation Min to 140 (Ignores Rust)
+    upper1 = np.array([10, 255, 255])
     
-    # Range 1: 0-10 (Deep Red)
-    lower_red1 = np.array([0, 120, 70])    # Saturation min 120 filters out brown rust
-    upper_red1 = np.array([10, 255, 255])
-    
-    # Range 2: 170-180 (Bright Red)
-    lower_red2 = np.array([170, 120, 70])
-    upper_red2 = np.array([180, 255, 255])
+    # Range 2: Bright Red
+    lower2 = np.array([170, 140, 60]) 
+    upper2 = np.array([180, 255, 255])
 
-    # Combine masks
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask = mask1 + mask2
+    mask = cv2.inRange(hsv, lower1, upper1) + cv2.inRange(hsv, lower2, upper2)
 
-    # C. Noise Reduction (Morphological Ops)
-    # Erode removes small specks (rust noise), Dilate restores the marker size
-    kernel = np.ones((3, 3), np.uint8)
+    # Clean Noise
+    kernel = np.ones((3,3), np.uint8)
     mask = cv2.erode(mask, kernel, iterations=1)
     mask = cv2.dilate(mask, kernel, iterations=2)
 
-    # D. Find the biggest red object
+    # Find Center
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     if contours:
-        # Find largest contour by area
-        largest_contour = max(contours, key=cv2.contourArea)
-        
-        if cv2.contourArea(largest_contour) > 50: # Minimum size filter
-            moments = cv2.moments(largest_contour)
-            if moments["m00"] > 0:
-                cx = int(moments["m10"] / moments["m00"])
-                cy = int(moments["m01"] / moments["m00"])
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) > 30: # Filter small specs
+            M = cv2.moments(largest)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
                 return cx, cy, frame.shape[1], frame.shape[0]
-
     return None
 
-# --- 3. WEBSOCKET SERVER ---
+# --- 3. SERVER ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("Client Connected")
+    # Reset physics on new connection
+    physics.accumulated_angle = 0.0
+    physics.last_raw_angle = None
+    physics.current_rpm = 0.0
     
     try:
         while True:
-            # Receive image data
             data = await websocket.receive_text()
-            
-            # Process Frame
             result = process_frame(data)
             
             if result:
-                cx, cy, width, height = result
-                
-                # Update Physics
-                rotations, rpm = physics.process_coordinates(cx, cy, width, height)
-                
-                # Send data back: "rotations,rpm,x,y"
-                await websocket.send_text(f"{rotations},{rpm},{cx},{cy}")
+                cx, cy, w, h = result
+                rots, rpm = physics.process_coordinates(cx, cy, w, h)
+                await websocket.send_text(f"{rots},{rpm},{cx},{cy}")
             else:
-                # If marker lost, send "null" but keep connection alive
                 await websocket.send_text("null")
                 
-            # Allow a tiny sleep to prevent CPU overload
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.005) # Prevent CPU throttling
             
     except WebSocketDisconnect:
-        print("Client Disconnected")
+        pass
